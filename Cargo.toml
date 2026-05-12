@@ -1,12 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["crates/absurd-sdk", "crates/absurdctl"]
+members = [
+    "crates/absurd-sdk",
+    "crates/absurd-macros",
+    "crates/absurdctl",
+    "crates/absurd-axum",
+]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "1.0.0"
 license = "Apache-2.0"
-repository = "https://github.com/earendil-works/absurd"
+repository = "https://github.com/nktkt/absurd"
 description = "Rust port of Absurd — durable workflows on Postgres"
 
 [workspace.dependencies]

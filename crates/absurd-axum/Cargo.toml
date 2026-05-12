@@ -1,0 +1,17 @@
+[package]
+name = "absurd-axum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Axum integration helpers for absurd-sdk"
+readme = "README.md"
+keywords = ["absurd", "axum", "workflow", "postgres"]
+categories = ["asynchronous", "web-programming"]
+
+[dependencies]
+absurd-sdk = { version = "1.0", path = "../absurd-sdk", default-features = false }
+axum = { version = "0.7", default-features = false, features = ["json"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

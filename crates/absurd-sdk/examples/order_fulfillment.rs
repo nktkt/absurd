@@ -64,8 +64,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-        let shipment: Value =
-            await_event(&format!("shipment.packed:{}", params.order_id)).await?;
+        let shipment: Value = await_event(&format!("shipment.packed:{}", params.order_id)).await?;
         let tracking = shipment
             .get("tracking_number")
             .cloned()
@@ -112,8 +111,12 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("spawned task: {}", spawn.task_id);
 
-    app.emit_event("default", "shipment.packed:42", json!({"tracking_number": "TRACK123"}))
-        .await?;
+    app.emit_event(
+        "default",
+        "shipment.packed:42",
+        json!({"tracking_number": "TRACK123"}),
+    )
+    .await?;
 
     let snapshot = app
         .await_task_result(

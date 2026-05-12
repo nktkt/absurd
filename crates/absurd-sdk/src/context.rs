@@ -39,6 +39,14 @@ struct TaskContextInner {
     wake_event: Mutex<Option<String>>,
     event_payload: Mutex<Option<Value>>,
     state: Mutex<TaskContextState>,
+    lease_observer: Option<Arc<dyn LeaseObserver>>,
+}
+
+/// Observer notified whenever the SDK extends the claim lease (e.g. via
+/// heartbeats or checkpoint writes). The worker uses this to reset its lease
+/// watchdog.
+pub trait LeaseObserver: Send + Sync + 'static {
+    fn observe(&self, lease: Duration);
 }
 
 struct TaskContextState {
@@ -55,6 +63,7 @@ impl TaskContext {
         queue_name: String,
         task: &ClaimedTask,
         claim_timeout: Duration,
+        lease_observer: Option<Arc<dyn LeaseObserver>>,
     ) -> Result<Self> {
         let headers = match &task.headers {
             Some(Value::Object(_)) => task.headers.clone().unwrap(),
@@ -88,6 +97,7 @@ impl TaskContext {
                     checkpoint_cache: HashMap::new(),
                     step_name_counter: HashMap::new(),
                 }),
+                lease_observer,
             }),
         };
 
@@ -184,11 +194,7 @@ impl TaskContext {
         }
     }
 
-    async fn persist_checkpoint(
-        &self,
-        checkpoint_name: &str,
-        value: Value,
-    ) -> Result<()> {
+    async fn persist_checkpoint(&self, checkpoint_name: &str, value: Value) -> Result<()> {
         let pool_client = self.inner.client.pool.get().await?;
         pool_client
             .execute(
@@ -205,11 +211,18 @@ impl TaskContext {
             )
             .await
             .map_err(map_state_error)?;
+        self.notify_lease_extended(self.inner.claim_timeout);
         let mut state = self.inner.state.lock().await;
         state
             .checkpoint_cache
             .insert(checkpoint_name.to_string(), value);
         Ok(())
+    }
+
+    fn notify_lease_extended(&self, lease: Duration) {
+        if let Some(obs) = &self.inner.lease_observer {
+            obs.observe(lease);
+        }
     }
 
     async fn schedule_run(&self, wake_at: DateTime<Utc>) -> Result<()> {
@@ -243,14 +256,13 @@ impl TaskContext {
             )
             .await
             .map_err(map_state_error)?;
+        self.notify_lease_extended(lease);
         Ok(())
     }
 
     pub async fn emit_event(&self, event_name: &str, payload: Value) -> Result<()> {
         if event_name.is_empty() {
-            return Err(AbsurdError::other(
-                "event name must be a non-empty string",
-            ));
+            return Err(AbsurdError::other("event name must be a non-empty string"));
         }
         let pool_client = self.inner.client.pool.get().await?;
         pool_client
@@ -283,13 +295,12 @@ impl TaskContext {
             let snapshot: TaskResultSnapshot = serde_json::from_value(raw)?;
             return Ok(snapshot);
         }
-        let heartbeat_interval = std::cmp::max(
-            self.inner.claim_timeout / 2,
-            MIN_HEARTBEAT_INTERVAL,
-        );
+        let heartbeat_interval =
+            std::cmp::max(self.inner.claim_timeout / 2, MIN_HEARTBEAT_INTERVAL);
         let this = self.clone();
-        let next_heartbeat =
-            std::sync::Arc::new(std::sync::Mutex::new(tokio::time::Instant::now() + heartbeat_interval));
+        let next_heartbeat = std::sync::Arc::new(std::sync::Mutex::new(
+            tokio::time::Instant::now() + heartbeat_interval,
+        ));
         let before_sleep = boxed_before_sleep(move || {
             let this = this.clone();
             let next_heartbeat = next_heartbeat.clone();
@@ -341,8 +352,8 @@ where
 /// Sleep for at least `d`. Suspends the task durably — if the worker dies
 /// while waiting, the task resumes from this point on the next claim.
 pub async fn sleep_for(step_name: &str, d: Duration) -> Result<()> {
-    let wake_at = Utc::now()
-        + chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::seconds(0));
+    let wake_at =
+        Utc::now() + chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::seconds(0));
     sleep_until(step_name, wake_at).await
 }
 
@@ -359,11 +370,8 @@ pub async fn sleep_until(step_name: &str, wake_at: DateTime<Utc>) -> Result<()> 
             }
         }
     } else {
-        ctx.persist_checkpoint(
-            &checkpoint,
-            Value::String(actual.to_rfc3339()),
-        )
-        .await?;
+        ctx.persist_checkpoint(&checkpoint, Value::String(actual.to_rfc3339()))
+            .await?;
     }
     if Utc::now() < actual {
         ctx.schedule_run(actual).await?;

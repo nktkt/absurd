@@ -1,17 +1,17 @@
 use crate::error::{map_state_error, AbsurdError, Result};
+use crate::hooks::Hooks;
 use crate::options::*;
-use crate::task::{FnHandler, RegisteredTask, TaskHandler};
+use crate::task::{FnHandler, RegisteredTask, TaskDefinition, TaskHandler};
 use crate::util::{duration_seconds, resolve_database_url, validate_queue_name};
 use crate::{DEFAULT_QUEUE_NAME, MAX_QUEUE_NAME_LENGTH};
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use serde::Deserialize;
+use deadpool_postgres::{ManagerConfig, Pool, RecyclingMethod};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio_postgres::NoTls;
 
 /// Builder for [`Client`].
 #[derive(Default)]
@@ -20,6 +20,7 @@ pub struct ClientBuilder {
     queue_name: Option<String>,
     default_max_attempts: Option<i32>,
     pool_size: Option<usize>,
+    hooks: Hooks,
 }
 
 impl ClientBuilder {
@@ -43,6 +44,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
     pub async fn build(self) -> Result<Client> {
         let dsn = resolve_database_url(self.database_url.as_deref());
         let pg_config = tokio_postgres::Config::from_str(&dsn)
@@ -50,22 +56,20 @@ impl ClientBuilder {
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
+        let mgr = crate::tls::build_manager(pg_config, mgr_config)?;
         let mut builder = Pool::builder(mgr);
         if let Some(size) = self.pool_size {
             builder = builder.max_size(size);
         }
         let pool = builder.build()?;
-        let queue_name = validate_queue_name(
-            self.queue_name
-                .as_deref()
-                .unwrap_or(DEFAULT_QUEUE_NAME),
-        )?;
+        let queue_name =
+            validate_queue_name(self.queue_name.as_deref().unwrap_or(DEFAULT_QUEUE_NAME))?;
         Ok(Client {
             pool,
             queue_name,
             default_max_attempts: self.default_max_attempts.unwrap_or(5),
             registry: Arc::new(RwLock::new(HashMap::new())),
+            hooks: self.hooks,
         })
     }
 }
@@ -78,6 +82,7 @@ pub struct Client {
     pub(crate) queue_name: String,
     pub(crate) default_max_attempts: i32,
     pub(crate) registry: Arc<RwLock<HashMap<String, RegisteredTask>>>,
+    pub(crate) hooks: Hooks,
 }
 
 impl Client {
@@ -99,14 +104,8 @@ impl Client {
     where
         H: TaskHandler,
     {
-        self.register_with(
-            name,
-            handler,
-            None::<&str>,
-            None,
-            None,
-        )
-        .await
+        self.register_with(name, handler, None::<&str>, None, None)
+            .await
     }
 
     /// Register a task with explicit queue and default options.
@@ -141,7 +140,7 @@ impl Client {
         Ok(())
     }
 
-    /// Register a typed Fn closure (operates on `serde_json::Value`).
+    /// Register an untyped Fn closure that operates on `serde_json::Value`.
     pub async fn register_fn<F, Fut>(&self, name: impl Into<String>, f: F) -> Result<()>
     where
         F: Fn(Value) -> Fut + Send + Sync + 'static,
@@ -150,15 +149,55 @@ impl Client {
         self.register(name, FnHandler(f)).await
     }
 
+    /// Register a strongly-typed task. Params and result types are pinned by
+    /// the [`TaskDefinition`] and validated at compile time at every
+    /// `spawn_task` call.
+    pub async fn register_task<P, R>(&self, def: TaskDefinition<P, R>) -> Result<()>
+    where
+        P: Serialize + DeserializeOwned + Send + 'static,
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        if def.name.is_empty() {
+            return Err(AbsurdError::other("task registration requires a name"));
+        }
+        let queue_name = match &def.queue_name {
+            Some(q) => validate_queue_name(q)?,
+            None => self.queue_name.clone(),
+        };
+        let registered = RegisteredTask {
+            name: def.name.clone(),
+            queue_name,
+            default_max_attempts: def.default_max_attempts,
+            default_cancellation: def.default_cancellation.clone(),
+            handler: def.handler.clone(),
+        };
+        self.registry.write().await.insert(def.name, registered);
+        Ok(())
+    }
+
+    /// Strongly-typed spawn. Serializes `params` and returns the same
+    /// [`SpawnResult`] as [`spawn`](Self::spawn). Bring your own task name —
+    /// or call `def.spawn(client, params, options)` once the definition is
+    /// in scope.
+    pub async fn spawn_typed<P, R>(
+        &self,
+        def: &TaskDefinition<P, R>,
+        params: P,
+        options: SpawnOptions,
+    ) -> Result<SpawnResult>
+    where
+        P: Serialize + Send + 'static,
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        let value = serde_json::to_value(params)?;
+        self.spawn(&def.name, value, options).await
+    }
+
     pub(crate) async fn get_registered(&self, name: &str) -> Option<RegisteredTask> {
         self.registry.read().await.get(name).cloned()
     }
 
-    pub async fn create_queue(
-        &self,
-        queue_name: &str,
-        options: CreateQueueOptions,
-    ) -> Result<()> {
+    pub async fn create_queue(&self, queue_name: &str, options: CreateQueueOptions) -> Result<()> {
         let validated = if queue_name.is_empty() {
             self.queue_name.clone()
         } else {
@@ -226,6 +265,205 @@ impl Client {
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
+    /// Read the persisted queue policy. Returns `None` if the queue doesn't
+    /// exist.
+    pub async fn get_queue_policy(&self, queue_name: &str) -> Result<Option<QueuePolicy>> {
+        let validated = validate_queue_name(queue_name)?;
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT queue_name, storage_mode, partition_lookahead::text, \
+                        partition_lookback::text, cleanup_ttl::text, cleanup_limit, \
+                        detach_mode, detach_min_age::text \
+                   FROM absurd.get_queue_policy($1)",
+                &[&validated],
+            )
+            .await?;
+        Ok(row.map(|r| QueuePolicy {
+            queue_name: r.get(0),
+            storage_mode: r.get(1),
+            partition_lookahead: r
+                .try_get::<_, Option<String>>(2)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            partition_lookback: r
+                .try_get::<_, Option<String>>(3)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            cleanup_ttl: r
+                .try_get::<_, Option<String>>(4)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            cleanup_limit: r.try_get(5).unwrap_or(0),
+            detach_mode: r.get(6),
+            detach_min_age: r
+                .try_get::<_, Option<String>>(7)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        }))
+    }
+
+    /// Run cleanup across all queues (or one specific queue). Returns per-queue
+    /// counts of deleted tasks and events.
+    pub async fn cleanup_queues(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<Vec<(String, CleanupReport)>> {
+        let arg: Option<String> = match queue_name {
+            None => None,
+            Some(q) if q.is_empty() => None,
+            Some(q) => Some(validate_queue_name(q)?),
+        };
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT queue_name, tasks_deleted, events_deleted \
+                   FROM absurd.cleanup_all_queues($1)",
+                &[&arg],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let name: String = r.get(0);
+                let tasks: i32 = r.get(1);
+                let events: i32 = r.get(2);
+                (
+                    name,
+                    CleanupReport {
+                        tasks_deleted: tasks as i64,
+                        events_deleted: events as i64,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Run task cleanup on a single queue with explicit TTL/limit.
+    pub async fn cleanup_tasks(
+        &self,
+        queue_name: &str,
+        ttl_seconds: i32,
+        limit: i32,
+    ) -> Result<i32> {
+        let validated = validate_queue_name(queue_name)?;
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT absurd.cleanup_tasks($1, $2, $3)",
+                &[&validated, &ttl_seconds, &limit],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    /// Run event cleanup on a single queue with explicit TTL/limit.
+    pub async fn cleanup_events(
+        &self,
+        queue_name: &str,
+        ttl_seconds: i32,
+        limit: i32,
+    ) -> Result<i32> {
+        let validated = validate_queue_name(queue_name)?;
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT absurd.cleanup_events($1, $2, $3)",
+                &[&validated, &ttl_seconds, &limit],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    /// Enumerate partitions that have aged past `detach_min_age` and are
+    /// candidates for detachment.
+    pub async fn list_detach_candidates(
+        &self,
+        queue_name: Option<&str>,
+    ) -> Result<Vec<DetachCandidate>> {
+        let arg: Option<String> = match queue_name {
+            None => None,
+            Some(q) if q.is_empty() => None,
+            Some(q) => Some(validate_queue_name(q)?),
+        };
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT queue_name, parent_table, partition_table \
+                   FROM absurd.list_detach_candidates($1)",
+                &[&arg],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DetachCandidate {
+                queue_name: r.get(0),
+                parent_table: r.get(1),
+                partition_table: r.get(2),
+            })
+            .collect())
+    }
+
+    /// Drop a previously detached partition. Returns true if the partition was
+    /// dropped (or already gone).
+    pub async fn drop_detached_partition(&self, partition_table: &str) -> Result<bool> {
+        let client = self.pool.get().await?;
+        let none: Option<&str> = None;
+        let row = client
+            .query_one(
+                "SELECT absurd.drop_detached_partition($1, $2)",
+                &[&partition_table, &none],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    /// Install pg_cron jobs that run partition/cleanup/detach maintenance.
+    pub async fn enable_cron(
+        &self,
+        queue_name: Option<&str>,
+        partition_schedule: &str,
+        cleanup_schedule: &str,
+        detach_schedule: &str,
+    ) -> Result<Vec<(String, i64)>> {
+        let arg: Option<String> = match queue_name {
+            None => None,
+            Some(q) if q.is_empty() => None,
+            Some(q) => Some(validate_queue_name(q)?),
+        };
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT job_name, job_id FROM absurd.enable_cron($1, $2, $3, $4)",
+                &[
+                    &arg,
+                    &partition_schedule,
+                    &cleanup_schedule,
+                    &detach_schedule,
+                ],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Tear down cron jobs installed by [`enable_cron`].
+    pub async fn disable_cron(&self, queue_name: Option<&str>) -> Result<Vec<String>> {
+        let arg: Option<String> = match queue_name {
+            None => None,
+            Some(q) if q.is_empty() => None,
+            Some(q) => Some(validate_queue_name(q)?),
+        };
+        let client = self.pool.get().await?;
+        let rows = client
+            .query("SELECT job_name FROM absurd.disable_cron($1)", &[&arg])
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
     pub async fn schema_version(&self) -> Result<Option<String>> {
         let client = self.pool.get().await?;
         let row = client
@@ -241,9 +479,7 @@ impl Client {
         payload: Value,
     ) -> Result<()> {
         if event_name.is_empty() {
-            return Err(AbsurdError::other(
-                "event name must be a non-empty string",
-            ));
+            return Err(AbsurdError::other("event name must be a non-empty string"));
         }
         let validated = validate_queue_name(queue_name)?;
         let client = self.pool.get().await?;
@@ -262,8 +498,12 @@ impl Client {
         params: Value,
         options: SpawnOptions,
     ) -> Result<SpawnResult> {
-        let (queue, max_attempts, cancellation) =
-            self.resolve_spawn(task_name, &options).await?;
+        let options = if let Some(hook) = self.hooks.before_spawn.clone() {
+            hook(task_name, params.clone(), options).await?
+        } else {
+            options
+        };
+        let (queue, max_attempts, cancellation) = self.resolve_spawn(task_name, &options).await?;
         let opts_payload = normalize_spawn_options(&SpawnOptions {
             queue_name: Some(queue.clone()),
             max_attempts: Some(max_attempts),

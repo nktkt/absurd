@@ -11,7 +11,7 @@ pub fn validate_queue_name(name: &str) -> Result<String> {
             "queue name must be provided".into(),
         ));
     }
-    if name.as_bytes().len() > MAX_QUEUE_NAME_LENGTH {
+    if name.len() > MAX_QUEUE_NAME_LENGTH {
         return Err(AbsurdError::InvalidQueueName(format!(
             "queue name {:?} is too long (max {} bytes)",
             name, MAX_QUEUE_NAME_LENGTH

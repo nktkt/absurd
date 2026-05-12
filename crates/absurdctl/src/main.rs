@@ -1,6 +1,6 @@
 use absurd_sdk::{
-    Client, CreateQueueOptions, QueueDetachMode, QueuePolicyOptions, QueueStorageMode, RetryStrategy,
-    RetryTaskOptions, SpawnOptions,
+    Client, CreateQueueOptions, QueueDetachMode, QueuePolicyOptions, QueueStorageMode,
+    RetryStrategy, RetryTaskOptions, SpawnOptions,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -107,6 +107,64 @@ enum Command {
     },
     /// Cancel a task.
     CancelTask { queue: String, task_id: String },
+    /// Run cleanup across queues (deletes expired tasks/events per queue
+    /// policy).
+    Cleanup {
+        /// Limit cleanup to a specific queue.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Run a per-queue cleanup with explicit TTL seconds (overrides
+        /// queue policy). Requires --queue.
+        #[arg(long)]
+        ttl_seconds: Option<i32>,
+        /// Limit per-call deletion (used with --ttl-seconds).
+        #[arg(long, default_value_t = 1000)]
+        limit: i32,
+        /// When --ttl-seconds is set, cleanup only events (not tasks).
+        #[arg(long)]
+        events_only: bool,
+    },
+    /// Print persisted queue policy.
+    QueuePolicy { queue: String },
+    /// Update queue policy fields.
+    SetQueuePolicy {
+        queue: String,
+        #[arg(long)]
+        partition_lookahead: Option<String>,
+        #[arg(long)]
+        partition_lookback: Option<String>,
+        #[arg(long)]
+        cleanup_ttl: Option<String>,
+        #[arg(long)]
+        cleanup_limit: Option<i32>,
+        #[arg(long, value_parser = ["none", "empty"])]
+        detach_mode: Option<String>,
+        #[arg(long)]
+        detach_min_age: Option<String>,
+    },
+    /// List partitions eligible for detachment.
+    ListDetachCandidates {
+        #[arg(long)]
+        queue: Option<String>,
+    },
+    /// Drop a previously detached partition.
+    DropDetachedPartition { partition_table: String },
+    /// Enable pg_cron maintenance jobs.
+    CronEnable {
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long, default_value = "5 * * * *")]
+        partition_schedule: String,
+        #[arg(long, default_value = "17 * * * *")]
+        cleanup_schedule: String,
+        #[arg(long, default_value = "29 * * * *")]
+        detach_schedule: String,
+    },
+    /// Disable pg_cron maintenance jobs.
+    CronDisable {
+        #[arg(long)]
+        queue: Option<String>,
+    },
     /// Print the bundled `absurd.sql` schema to stdout.
     PrintSchema,
 }
@@ -114,10 +172,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "warn,absurdctl=info".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn,absurdctl=info".into()))
         .init();
     let cli = Cli::parse();
     let database_url = resolve_db_url(&cli.db);
@@ -142,16 +197,52 @@ async fn main() -> Result<()> {
             }
         }
         Command::Migrate { dry_run } => {
-            // The bundled schema is idempotent: re-applying it is the
-            // simplest correct "migrate to latest" path for the Rust port.
-            if dry_run {
-                print!("{}", absurd_sdk::BUNDLED_SCHEMA_SQL);
-                return Ok(());
+            // Walk the bundled migration chain from the recorded version up
+            // to `main`. If the schema isn't installed at all yet, fall back
+            // to applying the full bundled schema.
+            let probe_client = build_client(&database_url).await.ok();
+            let current = match &probe_client {
+                Some(c) => c.schema_version().await.ok().flatten(),
+                None => None,
+            };
+            match current {
+                None => {
+                    if dry_run {
+                        print!("{}", absurd_sdk::BUNDLED_SCHEMA_SQL);
+                    } else {
+                        apply_sql(&database_url, absurd_sdk::BUNDLED_SCHEMA_SQL).await?;
+                        println!(
+                            "schema installed at version {}",
+                            absurd_sdk::migrations::TARGET_VERSION
+                        );
+                    }
+                }
+                Some(version) => {
+                    let target = absurd_sdk::migrations::TARGET_VERSION;
+                    let steps = absurd_sdk::migrations::resolve(&version, target)?;
+                    if steps.is_empty() {
+                        println!("schema already at {}", version);
+                        return Ok(());
+                    }
+                    if dry_run {
+                        for step in &steps {
+                            println!("-- migration {}", step.filename);
+                            print!("{}", step.sql);
+                        }
+                        return Ok(());
+                    }
+                    for step in &steps {
+                        tracing::info!(from = step.from, to = step.to, "applying migration");
+                        apply_sql(&database_url, step.sql).await?;
+                    }
+                    println!(
+                        "migrated {} -> {} ({} step(s))",
+                        version,
+                        target,
+                        steps.len()
+                    );
+                }
             }
-            apply_sql(&database_url, absurd_sdk::BUNDLED_SCHEMA_SQL).await?;
-            let client = build_client(&database_url).await?;
-            let version = client.schema_version().await?.unwrap_or_default();
-            println!("schema at version {}", version);
         }
         Command::CreateQueue {
             queue,
@@ -222,19 +313,16 @@ async fn main() -> Result<()> {
                 let (k, v) = kv
                     .split_once('=')
                     .ok_or_else(|| anyhow::anyhow!("header {kv:?} must be key=value"))?;
-                let parsed: Value = serde_json::from_str(v).unwrap_or_else(|_| Value::String(v.to_string()));
+                let parsed: Value =
+                    serde_json::from_str(v).unwrap_or_else(|_| Value::String(v.to_string()));
                 headers_map.insert(k.to_string(), parsed);
             }
-            let retry = if retry_kind.is_some() {
-                Some(RetryStrategy {
-                    kind: retry_kind.unwrap(),
-                    base_seconds: retry_base_seconds,
-                    factor: retry_factor,
-                    max_seconds: retry_max_seconds,
-                })
-            } else {
-                None
-            };
+            let retry = retry_kind.map(|kind| RetryStrategy {
+                kind,
+                base_seconds: retry_base_seconds,
+                factor: retry_factor,
+                max_seconds: retry_max_seconds,
+            });
             let result = client
                 .spawn(
                     &task_name,
@@ -294,6 +382,137 @@ async fn main() -> Result<()> {
             let client = build_client(&database_url).await?;
             client.cancel_task(&queue, &task_id).await?;
             println!("cancelled");
+        }
+        Command::Cleanup {
+            queue,
+            ttl_seconds,
+            limit,
+            events_only,
+        } => {
+            let client = build_client(&database_url).await?;
+            if let Some(ttl) = ttl_seconds {
+                let q = queue.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--queue is required when --ttl-seconds is used")
+                })?;
+                let deleted = if events_only {
+                    client.cleanup_events(q, ttl, limit).await?
+                } else {
+                    client.cleanup_tasks(q, ttl, limit).await?
+                };
+                println!("{} deleted", deleted);
+            } else {
+                let report = client.cleanup_queues(queue.as_deref()).await?;
+                for (q, r) in &report {
+                    println!(
+                        "{}\ttasks={}\tevents={}",
+                        q, r.tasks_deleted, r.events_deleted
+                    );
+                }
+                if report.is_empty() {
+                    println!("nothing to clean");
+                }
+            }
+        }
+        Command::QueuePolicy { queue } => {
+            let client = build_client(&database_url).await?;
+            match client.get_queue_policy(&queue).await? {
+                Some(p) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "queue_name": p.queue_name,
+                        "storage_mode": p.storage_mode,
+                        "partition_lookahead": p.partition_lookahead,
+                        "partition_lookback": p.partition_lookback,
+                        "cleanup_ttl": p.cleanup_ttl,
+                        "cleanup_limit": p.cleanup_limit,
+                        "detach_mode": p.detach_mode,
+                        "detach_min_age": p.detach_min_age,
+                    }))?
+                ),
+                None => println!("(no such queue)"),
+            }
+        }
+        Command::SetQueuePolicy {
+            queue,
+            partition_lookahead,
+            partition_lookback,
+            cleanup_ttl,
+            cleanup_limit,
+            detach_mode,
+            detach_min_age,
+        } => {
+            let client = build_client(&database_url).await?;
+            let detach = match detach_mode.as_deref() {
+                Some("empty") => Some(absurd_sdk::QueueDetachMode::Empty),
+                Some("none") => Some(absurd_sdk::QueueDetachMode::None),
+                _ => None,
+            };
+            client
+                .set_queue_policy(
+                    &queue,
+                    absurd_sdk::QueuePolicyOptions {
+                        partition_lookahead,
+                        partition_lookback,
+                        cleanup_ttl,
+                        cleanup_limit,
+                        detach_mode: detach,
+                        detach_min_age,
+                    },
+                )
+                .await?;
+            println!("policy updated");
+        }
+        Command::ListDetachCandidates { queue } => {
+            let client = build_client(&database_url).await?;
+            let rows = client.list_detach_candidates(queue.as_deref()).await?;
+            if rows.is_empty() {
+                println!("(none)");
+            } else {
+                for r in rows {
+                    println!(
+                        "{}\t{}\t{}",
+                        r.queue_name, r.parent_table, r.partition_table
+                    );
+                }
+            }
+        }
+        Command::DropDetachedPartition { partition_table } => {
+            let client = build_client(&database_url).await?;
+            let ok = client.drop_detached_partition(&partition_table).await?;
+            println!(
+                "{}",
+                if ok {
+                    "dropped"
+                } else {
+                    "no-op (not detached)"
+                }
+            );
+        }
+        Command::CronEnable {
+            queue,
+            partition_schedule,
+            cleanup_schedule,
+            detach_schedule,
+        } => {
+            let client = build_client(&database_url).await?;
+            let jobs = client
+                .enable_cron(
+                    queue.as_deref(),
+                    &partition_schedule,
+                    &cleanup_schedule,
+                    &detach_schedule,
+                )
+                .await?;
+            for (name, id) in jobs {
+                println!("{}\t{}", id, name);
+            }
+        }
+        Command::CronDisable { queue } => {
+            let client = build_client(&database_url).await?;
+            let jobs = client.disable_cron(queue.as_deref()).await?;
+            for name in jobs {
+                println!("{}", name);
+            }
         }
     }
     Ok(())

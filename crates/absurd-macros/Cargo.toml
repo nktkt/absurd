@@ -1,0 +1,18 @@
+[package]
+name = "absurd-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Procedural macros for absurd-sdk"
+readme = "README.md"
+keywords = ["absurd", "workflow", "macro", "postgres"]
+categories = ["asynchronous"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

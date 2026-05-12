@@ -5,6 +5,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Durable workflows on Postgres — Rust SDK for Absurd"
+readme = "README.md"
+keywords = ["postgres", "workflow", "durable", "queue", "async"]
+categories = ["asynchronous", "database"]
+
+[features]
+default = ["macros"]
+# Re-export the #[task] attribute macro from absurd-macros.
+macros = ["dep:absurd-macros"]
+# Bring your own TLS backend. With `rustls` enabled, the SDK uses
+# tokio-postgres-rustls under the hood; with `native-tls`, it uses
+# postgres-native-tls. Either feature is fine — pick whichever fits your
+# wider dependency tree. Both can be enabled simultaneously; `rustls` wins
+# at runtime when both are configured.
+rustls = ["dep:rustls", "dep:rustls-native-certs", "dep:tokio-postgres-rustls", "dep:webpki-roots"]
+native-tls = ["dep:native-tls", "dep:postgres-native-tls"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -20,6 +35,14 @@ futures = { workspace = true }
 hostname = { workspace = true }
 once_cell = { workspace = true }
 fnv = { workspace = true }
+
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+rustls-native-certs = { version = "0.8", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+native-tls = { version = "0.2", optional = true }
+postgres-native-tls = { version = "0.5", optional = true }
+absurd-macros = { version = "1.0", path = "../absurd-macros", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
