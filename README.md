@@ -113,6 +113,10 @@ cargo build --release
 
 Requires Rust 1.85+ (uses edition 2021 + recent tokio).
 
+## Roadmap
+
+See [ROADMAP.md](./ROADMAP.md) for what's planned next (typed handlers, TLS, missing CLI commands, stepwise migrations, habitat web UI port, …).
+
 ## License
 
 Apache-2.0. The bundled SQL schema is the upstream `earendil-works/absurd` schema, also Apache-2.0.
