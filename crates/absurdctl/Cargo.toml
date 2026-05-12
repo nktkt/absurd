@@ -1,0 +1,22 @@
+[package]
+name = "absurdctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for managing Absurd schemas, queues, and tasks"
+
+[[bin]]
+name = "absurdctl"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+absurd-sdk = { path = "../absurd-sdk" }

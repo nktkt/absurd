@@ -1,0 +1,26 @@
+[package]
+name = "absurd-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable workflows on Postgres — Rust SDK for Absurd"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+hostname = { workspace = true }
+once_cell = { workspace = true }
+fnv = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
